@@ -1,8 +1,11 @@
 """Core ETL Engine for NotesToNotion."""
 
 import asyncio
+import random
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 import google.generativeai as genai
 from google.generativeai.types import File
@@ -10,6 +13,63 @@ from notion_client import AsyncClient as NotionClient
 from rich.console import Console
 
 console = Console()
+
+T = TypeVar("T")
+
+
+async def retry_with_backoff(
+    func: Callable[[], T],
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    retryable_errors: tuple = (Exception,),
+) -> T:
+    """Execute a function with exponential backoff retry.
+
+    Args:
+        func: The function to execute (sync or async).
+        max_retries: Maximum number of retry attempts.
+        base_delay: Initial delay in seconds.
+        max_delay: Maximum delay between retries.
+        retryable_errors: Tuple of exception types to retry on.
+
+    Returns:
+        The result of the function.
+
+    Raises:
+        The last exception if all retries fail.
+    """
+    last_exception = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = func()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        except retryable_errors as e:
+            last_exception = e
+            error_msg = str(e).lower()
+
+            is_rate_limit = any(
+                x in error_msg for x in ["429", "rate", "quota", "exhausted", "limit"]
+            )
+
+            if attempt == max_retries:
+                raise
+
+            if is_rate_limit:
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+                console.print(
+                    f"[yellow]Rate limit hit. Retry {attempt + 1}/{max_retries} "
+                    f"in {delay:.1f}s...[/yellow]"
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise
+
+    raise last_exception  # type: ignore
 
 SYSTEM_PROMPT = """You are a Scientific Typesetter specialized in transcribing handwritten mathematical notes.
 
@@ -70,10 +130,12 @@ class Engine:
 
         console.print(f"[blue]Uploading[/blue] {path.name} to Gemini...")
 
-        uploaded_file = await asyncio.to_thread(
-            genai.upload_file,
-            path,
-            mime_type="application/pdf",
+        uploaded_file = await retry_with_backoff(
+            lambda: asyncio.to_thread(
+                genai.upload_file,
+                path,
+                mime_type="application/pdf",
+            )
         )
 
         console.print("[yellow]Waiting for Gemini processing...[/yellow]")
@@ -84,9 +146,11 @@ class Engine:
 
         console.print("[green]Processing complete.[/green] Generating transcription...")
 
-        response = await asyncio.to_thread(
-            self.model.generate_content,
-            [SYSTEM_PROMPT, file_state],
+        response = await retry_with_backoff(
+            lambda: asyncio.to_thread(
+                self.model.generate_content,
+                [SYSTEM_PROMPT, file_state],
+            )
         )
 
         await asyncio.to_thread(genai.delete_file, uploaded_file.name)
@@ -148,10 +212,12 @@ class Engine:
         blocks = self._markdown_to_notion_blocks(markdown)
 
         try:
-            page = await self.notion.pages.create(
-                parent={"database_id": self.notion_db_id},
-                properties={"Name": {"title": [{"text": {"content": page_title}}]}},
-                children=blocks,
+            page = await retry_with_backoff(
+                lambda: self.notion.pages.create(
+                    parent={"database_id": self.notion_db_id},
+                    properties={"Name": {"title": [{"text": {"content": page_title}}]}},
+                    children=blocks,
+                )
             )
 
             page_url = page.get("url", "")
