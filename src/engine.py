@@ -13,6 +13,10 @@ from google import genai
 from google.genai import types
 from notion_client import AsyncClient as NotionClient
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+from src.config import AppConfig
+from src.exceptions import PDFValidationError, TranscriptionError
 
 console = Console()
 
@@ -114,13 +118,12 @@ Output the transcription now:"""
 class Engine:
     """Main ETL engine for PDF to Notion pipeline."""
 
-    NOTION_BLOCK_LIMIT = 2000
-
     def __init__(
         self,
         google_api_key: str,
         notion_key: str,
         notion_db_id: str,
+        config: AppConfig | None = None,
     ) -> None:
         """Initialize the engine with API credentials.
 
@@ -128,11 +131,16 @@ class Engine:
             google_api_key: Google Gemini API key.
             notion_key: Notion integration token.
             notion_db_id: Target Notion database ID.
+            config: Optional configuration. Uses defaults if not provided.
         """
+        self.config = config or AppConfig.default()
         self.genai = genai.Client(api_key=google_api_key)
-        self.model_name = "gemini-2.0-flash"
+        self.model_name = self.config.gemini.model
         self.notion = NotionClient(auth=notion_key)
         self.notion_db_id = notion_db_id
+
+        # Cached property for backward compatibility
+        self.NOTION_BLOCK_LIMIT = self.config.notion.block_limit
 
     async def transcribe_pdf(self, pdf_path: str) -> str:
         """Transcribe a PDF file using Gemini's native PDF ingestion.
@@ -145,11 +153,39 @@ class Engine:
 
         Raises:
             FileNotFoundError: If PDF file doesn't exist.
+            PDFValidationError: If PDF file is invalid (wrong format, too large, etc.).
+            TranscriptionError: If transcription fails or returns empty result.
             RuntimeError: If Gemini processing fails.
         """
         path = Path(pdf_path)
+
+        # Validation 1: File existence
         if not path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+        # Validation 2: File extension
+        if path.suffix.lower() != ".pdf":
+            raise PDFValidationError(
+                f"File must be a PDF, got: {path.suffix}\n"
+                f"Please provide a valid PDF file."
+            )
+
+        # Validation 3: File size
+        file_size_mb = path.stat().st_size / (1024 * 1024)
+        max_size_mb = self.config.gemini.max_file_size_mb
+
+        if file_size_mb > max_size_mb:
+            raise PDFValidationError(
+                f"PDF too large: {file_size_mb:.1f}MB (max {max_size_mb}MB)\n"
+                f"Please compress or split the PDF before uploading."
+            )
+
+        # Warning for suspiciously small files
+        if file_size_mb < 0.001:  # < 1KB
+            console.print(
+                f"[yellow]Warning:[/yellow] File is very small ({file_size_mb*1024:.1f}KB). "
+                f"It may be empty or corrupted."
+            )
 
         console.print(f"[blue]Uploading[/blue] {path.name} to Gemini...")
 
@@ -180,39 +216,63 @@ class Engine:
 
         await self.genai.aio.files.delete(name=uploaded_file.name)
 
-        return response.text
+        # Validation 4: Check transcription is not empty
+        transcription = response.text
+        if not transcription or len(transcription.strip()) < 10:
+            console.print(
+                "[yellow]Warning:[/yellow] Transcription is very short or empty. "
+                "The PDF may be empty, corrupted, or contain only images."
+            )
+
+        return transcription
 
     async def _wait_for_file_active(
         self,
         uploaded_file: types.File,
-        timeout: int = 120,
-        poll_interval: float = 2.0,
+        timeout: int | None = None,
+        poll_interval: float | None = None,
     ) -> types.File:
-        """Poll until file is in ACTIVE state.
+        """Poll until file is in ACTIVE state with progress bar.
 
         Args:
             uploaded_file: The uploaded file object.
-            timeout: Maximum wait time in seconds.
-            poll_interval: Time between status checks.
+            timeout: Maximum wait time in seconds. Uses config default if None.
+            poll_interval: Time between status checks. Uses config default if None.
 
         Returns:
             File object in ACTIVE state.
 
         Raises:
             TimeoutError: If file doesn't become active within timeout.
+            RuntimeError: If file processing fails.
         """
+        timeout = timeout or self.config.gemini.upload_timeout
+        poll_interval = poll_interval or self.config.gemini.poll_interval
         start_time = time.time()
 
-        while time.time() - start_time < timeout:
-            file_state = await self.genai.aio.files.get(name=uploaded_file.name)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]Processing PDF..."),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("", total=timeout)
 
-            if file_state.state == "ACTIVE":
-                return file_state
+            while time.time() - start_time < timeout:
+                file_state = await self.genai.aio.files.get(name=uploaded_file.name)
 
-            if file_state.state == "FAILED":
-                raise RuntimeError("File processing failed")
+                if file_state.state == "ACTIVE":
+                    progress.update(task, completed=timeout)
+                    return file_state
 
-            await asyncio.sleep(poll_interval)
+                if file_state.state == "FAILED":
+                    raise RuntimeError("File processing failed")
+
+                elapsed = time.time() - start_time
+                progress.update(task, completed=elapsed)
+                await asyncio.sleep(poll_interval)
 
         raise TimeoutError(f"File did not become active within {timeout}s")
 
@@ -601,7 +661,7 @@ class Engine:
             markdown: Content to save.
             page_title: Used for filename.
         """
-        backup_dir = Path("backups")
+        backup_dir = Path(self.config.backup_dir)
         backup_dir.mkdir(exist_ok=True)
 
         safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in page_title)

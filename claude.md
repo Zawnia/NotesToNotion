@@ -26,13 +26,22 @@ Build "NotesToNotion", a hyper-optimized ETL (Extract, Transform, Load) pipeline
 - [x] Local backup system (auto-save on Notion failure)
 - [x] CLI entry point (`main.py`)
 - [x] Rich terminal logging
+- [x] Retry logic with exponential backoff (API failures)
 
-### TODO (Remaining Tasks)
-- [ ] Test with real PDF files (validation)
-- [ ] Handle edge cases (empty pages, corrupted PDFs)
-- [ ] Add retry logic for API failures
-- [ ] Implement progress bar during Gemini wait
-- [ ] Create test suite (`pytest-asyncio`)
+### DONE (Phase 1 & 2 - Robustness & UX)
+- [x] **Test Suite** - 20 passing tests with pytest-asyncio
+- [x] **Edge Case Handling** - PDF validation (size, format, existence)
+- [x] **Custom Exceptions** - PDFValidationError, TranscriptionError, NotionError
+- [x] **Configuration System** - Externalized config (no more hardcoding)
+- [x] **Progress Bar** - Visual feedback during Gemini processing
+- [x] **Improved Error Messages** - Specific catches with actionable suggestions
+
+### TODO (Future Enhancements)
+- [ ] Test with more real PDF files (edge case validation)
+- [ ] Batch processing (handle multiple PDFs in one run)
+- [ ] CLI arguments with argparse (--title, --timeout, etc.)
+- [ ] Smart titles (auto-generate from content)
+- [ ] Post-processing (clean Gemini artifacts)
 
 ---
 
@@ -47,21 +56,32 @@ NotesToNotion/
 ├── requirements.txt      # Dependencies
 ├── main.py               # CLI entry point
 ├── backups/              # Auto-created for failed Notion pushes
-└── src/
-    ├── __init__.py       # Exports Engine class
-    └── engine.py         # Core ETL logic
+├── src/
+│   ├── __init__.py       # Exports Engine class
+│   ├── engine.py         # Core ETL logic
+│   ├── config.py         # Configuration management (NEW)
+│   └── exceptions.py     # Custom exceptions (NEW)
+└── tests/
+    ├── __init__.py
+    ├── conftest.py       # Pytest fixtures
+    ├── test_engine.py    # Unit tests (20 tests)
+    └── fixtures/         # Test PDFs
 ```
 
 ### Key Components
 
 | File | Responsibility |
 |------|----------------|
-| `main.py` | CLI args, env loading, pipeline orchestration |
+| `main.py` | CLI args, env loading, pipeline orchestration, error handling |
 | `src/engine.py` | `Engine` class - all ETL logic |
-| `Engine.transcribe_pdf()` | Upload PDF to Gemini, wait for ACTIVE, get Markdown |
+| `src/config.py` | Configuration classes (GeminiConfig, NotionConfig, AppConfig) |
+| `src/exceptions.py` | Custom exceptions (PDFValidationError, TranscriptionError, NotionError) |
+| `Engine.transcribe_pdf()` | Upload PDF to Gemini, wait for ACTIVE, get Markdown (with validation) |
 | `Engine.push_to_notion()` | Convert Markdown to Notion blocks, create page |
 | `Engine._parse_rich_text()` | LaTeX detection and conversion |
 | `Engine._chunk_text()` | Smart splitting for 2000 char limit |
+| `Engine._wait_for_file_active()` | Poll file state with progress bar |
+| `tests/test_engine.py` | 20 unit tests covering all core functionality |
 
 ---
 

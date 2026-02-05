@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from src.engine import Engine
+from src.exceptions import PDFValidationError, TranscriptionError, NotionError
 
 console = Console()
 
@@ -86,11 +87,64 @@ async def run_pipeline(pdf_path: str) -> None:
         )
 
     except FileNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"\n[red]Error:[/red] {e}")
+        console.print("\n[yellow]Suggestion:[/yellow] Check that the file path is correct")
+        console.print(f"  • Make sure the file exists: {pdf_path}")
+        console.print(f"  • Check for typos in the path")
+        sys.exit(1)
+
+    except PDFValidationError as e:
+        console.print(f"\n[red]Validation Error:[/red] {e}")
+        console.print("\n[yellow]Suggestions:[/yellow]")
+        if "too large" in str(e).lower():
+            console.print("  • Compress the PDF using online tools")
+            console.print("  • Split the PDF into smaller files")
+        elif "must be a pdf" in str(e).lower():
+            console.print("  • Ensure the file has a .pdf extension")
+            console.print("  • Convert the file to PDF format")
+        sys.exit(1)
+
+    except TimeoutError as e:
+        console.print(f"\n[red]Timeout:[/red] {e}")
+        console.print("\n[yellow]Suggestions:[/yellow]")
+        console.print("  • Try with a smaller PDF file")
+        console.print("  • Check your internet connection")
+        console.print("  • Wait a moment and try again (Gemini may be busy)")
+        sys.exit(1)
+
+    except TranscriptionError as e:
+        console.print(f"\n[red]Transcription Error:[/red] {e}")
+        console.print("\n[yellow]Suggestions:[/yellow]")
+        console.print("  • Check if the PDF contains readable text")
+        console.print("  • Ensure the PDF is not corrupted")
+        console.print("  • Try re-scanning the document with better quality")
+        sys.exit(1)
+
+    except NotionError as e:
+        console.print(f"\n[red]Notion Error:[/red] {e}")
+        console.print("\n[yellow]Suggestions:[/yellow]")
+        console.print("  • Check your Notion API key is valid")
+        console.print("  • Verify the database ID is correct")
+        console.print("  • Ensure the integration has access to the database")
+        console.print(f"\n[dim]Check backups/ folder for saved transcription[/dim]")
+        sys.exit(1)
+
+    except RuntimeError as e:
+        error_msg = str(e)
+        console.print(f"\n[red]Runtime Error:[/red] {error_msg}")
+
+        if "processing failed" in error_msg.lower():
+            console.print("\n[yellow]Suggestions:[/yellow]")
+            console.print("  • The PDF may be corrupted or in an unsupported format")
+            console.print("  • Try re-saving or re-exporting the PDF")
+            console.print("  • Contact support if the issue persists")
+
         sys.exit(1)
 
     except Exception as e:
-        console.print(f"[red]Pipeline failed:[/red] {e}")
+        console.print(f"\n[red]Unexpected Error:[/red] {e}")
+        console.print("\n[dim]Check backups/ folder for any saved transcription[/dim]")
+        console.print("[dim]Run with --verbose flag for more details (coming soon)[/dim]")
         sys.exit(1)
 
 
