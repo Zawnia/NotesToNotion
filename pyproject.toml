@@ -8,7 +8,7 @@ authors = [
     { name = "NotesToNotion" }
 ]
 dependencies = [
-    "google-generativeai>=0.8.0",
+    "google-genai>=1.0.0",
     "notion-client>=2.2.0",
     "python-dotenv>=1.0.0",
     "rich>=13.7.0",

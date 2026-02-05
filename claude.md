@@ -97,7 +97,7 @@ NotesToNotion/
 | Layer | Technology | Version | Purpose |
 |-------|------------|---------|---------|
 | Language | Python | 3.12+ | Asyncio native, type hints |
-| AI Engine | `google-generativeai` | >=0.8.0 | Native PDF ingestion |
+| AI Engine | `google-genai` | >=1.0.0 | Native PDF ingestion |
 | Model | Gemini 2.0 Flash | - | Cost-efficient, fast |
 | Integration | `notion-client` | >=2.2.0 | Async Notion API |
 | Config | `python-dotenv` | >=1.0.0 | Environment management |

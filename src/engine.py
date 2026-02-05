@@ -4,17 +4,40 @@ import asyncio
 import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TypeVar
 
-import google.generativeai as genai
-from google.generativeai.types import File
+from google import genai
+from google.genai import types
 from notion_client import AsyncClient as NotionClient
 from rich.console import Console
 
 console = Console()
 
 T = TypeVar("T")
+
+
+class BlockType(Enum):
+    """Semantic block types for markdown parsing."""
+
+    HEADING_1 = "heading_1"
+    HEADING_2 = "heading_2"
+    HEADING_3 = "heading_3"
+    PARAGRAPH = "paragraph"
+    EQUATION = "equation"
+    BULLETED_LIST_ITEM = "bulleted_list_item"
+    NUMBERED_LIST_ITEM = "numbered_list_item"
+
+
+@dataclass
+class SemanticBlock:
+    """Represents a semantic block from markdown."""
+
+    type: BlockType
+    content: str
+    level: int | None = None  # For headings only
 
 
 async def retry_with_backoff(
@@ -106,8 +129,8 @@ class Engine:
             notion_key: Notion integration token.
             notion_db_id: Target Notion database ID.
         """
-        genai.configure(api_key=google_api_key)
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        self.genai = genai.Client(api_key=google_api_key)
+        self.model_name = "gemini-2.0-flash"
         self.notion = NotionClient(auth=notion_key)
         self.notion_db_id = notion_db_id
 
@@ -131,38 +154,40 @@ class Engine:
         console.print(f"[blue]Uploading[/blue] {path.name} to Gemini...")
 
         uploaded_file = await retry_with_backoff(
-            lambda: asyncio.to_thread(
-                genai.upload_file,
-                path,
-                mime_type="application/pdf",
+            lambda: self.genai.aio.files.upload(
+                file=path,
+                config=types.UploadFileConfig(mime_type="application/pdf"),
             )
         )
 
         console.print("[yellow]Waiting for Gemini processing...[/yellow]")
         file_state = await self._wait_for_file_active(uploaded_file)
 
-        if file_state.state.name != "ACTIVE":
-            raise RuntimeError(f"File processing failed: {file_state.state.name}")
+        if file_state.state != "ACTIVE":
+            raise RuntimeError(f"File processing failed: {file_state.state}")
 
         console.print("[green]Processing complete.[/green] Generating transcription...")
 
         response = await retry_with_backoff(
-            lambda: asyncio.to_thread(
-                self.model.generate_content,
-                [SYSTEM_PROMPT, file_state],
+            lambda: self.genai.aio.models.generate_content(
+                model=self.model_name,
+                contents=[file_state, "Transcribe this document."],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                ),
             )
         )
 
-        await asyncio.to_thread(genai.delete_file, uploaded_file.name)
+        await self.genai.aio.files.delete(name=uploaded_file.name)
 
         return response.text
 
     async def _wait_for_file_active(
         self,
-        uploaded_file: File,
+        uploaded_file: types.File,
         timeout: int = 120,
         poll_interval: float = 2.0,
-    ) -> File:
+    ) -> types.File:
         """Poll until file is in ACTIVE state.
 
         Args:
@@ -179,15 +204,12 @@ class Engine:
         start_time = time.time()
 
         while time.time() - start_time < timeout:
-            file_state = await asyncio.to_thread(
-                genai.get_file,
-                uploaded_file.name,
-            )
+            file_state = await self.genai.aio.files.get(name=uploaded_file.name)
 
-            if file_state.state.name == "ACTIVE":
+            if file_state.state == "ACTIVE":
                 return file_state
 
-            if file_state.state.name == "FAILED":
+            if file_state.state == "FAILED":
                 raise RuntimeError("File processing failed")
 
             await asyncio.sleep(poll_interval)
@@ -230,7 +252,11 @@ class Engine:
             raise
 
     def _markdown_to_notion_blocks(self, markdown: str) -> list[dict]:
-        """Convert markdown to Notion block format with chunking.
+        """Convert markdown to Notion blocks via semantic parsing.
+
+        Uses a two-phase approach:
+        1. Parse markdown into semantic blocks (state machine)
+        2. Convert semantic blocks to Notion format with chunking
 
         Args:
             markdown: Raw markdown text.
@@ -238,45 +264,156 @@ class Engine:
         Returns:
             List of Notion block objects.
         """
-        blocks: list[dict] = []
+        # Phase 1: Tokenize into semantic blocks
+        semantic_blocks = self._parse_semantic_blocks(markdown)
+
+        # Phase 2: Convert to Notion format with chunking
+        notion_blocks = []
+        for block in semantic_blocks:
+            notion_blocks.extend(self._semantic_to_notion(block))
+
+        return notion_blocks
+
+    def _parse_semantic_blocks(self, markdown: str) -> list[SemanticBlock]:
+        """Parse markdown into semantic blocks using state machine.
+
+        Args:
+            markdown: Raw markdown text.
+
+        Returns:
+            List of semantic blocks.
+        """
+        blocks: list[SemanticBlock] = []
         lines = markdown.split("\n")
-        current_paragraph: list[str] = []
+        i = 0
 
-        for line in lines:
-            if line.startswith("# "):
-                if current_paragraph:
-                    blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
-                    current_paragraph = []
-                blocks.append(self._create_heading_block(line[2:], level=1))
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
 
-            elif line.startswith("## "):
-                if current_paragraph:
-                    blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
-                    current_paragraph = []
-                blocks.append(self._create_heading_block(line[3:], level=2))
+            # State 1: Headings (single-line)
+            if stripped.startswith("### "):
+                blocks.append(SemanticBlock(BlockType.HEADING_3, stripped[4:]))
+                i += 1
+            elif stripped.startswith("## "):
+                blocks.append(SemanticBlock(BlockType.HEADING_2, stripped[3:]))
+                i += 1
+            elif stripped.startswith("# "):
+                blocks.append(SemanticBlock(BlockType.HEADING_1, stripped[2:]))
+                i += 1
 
-            elif line.startswith("### "):
-                if current_paragraph:
-                    blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
-                    current_paragraph = []
-                blocks.append(self._create_heading_block(line[4:], level=3))
+            # State 2: Block equations (multi-line accumulation)
+            elif stripped == "$$":
+                equation_lines = []
+                i += 1
+                while i < len(lines) and lines[i].strip() != "$$":
+                    equation_lines.append(lines[i])
+                    i += 1
+                i += 1  # Skip closing $$
+                equation = "\n".join(equation_lines).strip()
+                blocks.append(SemanticBlock(BlockType.EQUATION, equation))
 
-            elif line.startswith("$$") or line.strip() == "$$":
-                if current_paragraph:
-                    blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
-                    current_paragraph = []
-                current_paragraph.append(line)
+            # State 3: Bulleted lists
+            elif stripped.startswith("- ") or stripped.startswith("* "):
+                blocks.append(SemanticBlock(BlockType.BULLETED_LIST_ITEM, stripped[2:]))
+                i += 1
 
-            elif line.strip() == "":
-                if current_paragraph:
-                    blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
-                    current_paragraph = []
+            # State 4: Numbered lists
+            elif stripped and stripped[0].isdigit() and ". " in stripped:
+                content = stripped.split(". ", 1)[1] if ". " in stripped else stripped
+                blocks.append(SemanticBlock(BlockType.NUMBERED_LIST_ITEM, content))
+                i += 1
 
+            # State 5: Empty lines (skip)
+            elif stripped == "":
+                i += 1
+
+            # State 6: Paragraphs (accumulate until empty line or special line)
             else:
-                current_paragraph.append(line)
+                para_lines = []
+                while (
+                    i < len(lines)
+                    and lines[i].strip() != ""
+                    and not self._is_special_line(lines[i])
+                ):
+                    para_lines.append(lines[i].strip())
+                    i += 1
+                if para_lines:
+                    blocks.append(SemanticBlock(BlockType.PARAGRAPH, "\n".join(para_lines)))
 
-        if current_paragraph:
-            blocks.extend(self._create_text_blocks("\n".join(current_paragraph)))
+        return blocks
+
+    def _is_special_line(self, line: str) -> bool:
+        """Check if line starts a special block (heading, equation, list).
+
+        Args:
+            line: Line to check.
+
+        Returns:
+            True if line starts a special block.
+        """
+        stripped = line.strip()
+        return (
+            stripped.startswith("#")
+            or stripped == "$$"
+            or stripped.startswith("- ")
+            or stripped.startswith("* ")
+            or (len(stripped) > 0 and stripped[0].isdigit() and ". " in stripped)
+        )
+
+    def _semantic_to_notion(self, block: SemanticBlock) -> list[dict]:
+        """Convert semantic block to Notion blocks with chunking.
+
+        Args:
+            block: Semantic block to convert.
+
+        Returns:
+            List of Notion block objects.
+        """
+        if block.type == BlockType.EQUATION:
+            # Equation blocks are standalone (no rich_text parsing)
+            return [
+                {
+                    "object": "block",
+                    "type": "equation",
+                    "equation": {"expression": block.content[: self.NOTION_BLOCK_LIMIT]},
+                }
+            ]
+
+        elif block.type == BlockType.BULLETED_LIST_ITEM:
+            return self._create_list_blocks(block.content, "bulleted_list_item")
+
+        elif block.type == BlockType.NUMBERED_LIST_ITEM:
+            return self._create_list_blocks(block.content, "numbered_list_item")
+
+        elif block.type in [BlockType.HEADING_1, BlockType.HEADING_2, BlockType.HEADING_3]:
+            level = int(block.type.value.split("_")[1])
+            return [self._create_heading_block(block.content, level)]
+
+        else:  # PARAGRAPH
+            return self._create_text_blocks(block.content)
+
+    def _create_list_blocks(self, text: str, list_type: str) -> list[dict]:
+        """Create list item blocks with chunking support.
+
+        Args:
+            text: List item text content.
+            list_type: Type of list ('bulleted_list_item' or 'numbered_list_item').
+
+        Returns:
+            List of Notion list item blocks.
+        """
+        blocks: list[dict] = []
+        chunks = self._chunk_text(text)
+
+        for chunk in chunks:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": list_type,
+                    list_type: {"rich_text": self._parse_rich_text(chunk)},
+                }
+            )
 
         return blocks
 
@@ -379,20 +516,45 @@ class Engine:
         return chunks
 
     def _parse_rich_text(self, text: str) -> list[dict]:
-        """Parse text with LaTeX into Notion rich_text format.
+        """Parse text with LaTeX and newlines into Notion rich_text format.
 
         Notion supports equations via the 'equation' type in rich_text.
+        Preserves line breaks by splitting on newlines.
 
         Args:
-            text: Text potentially containing LaTeX.
+            text: Text potentially containing LaTeX and newlines.
 
         Returns:
             List of rich_text objects.
+        """
+        # Split by newlines to preserve line breaks
+        lines = text.split("\n")
+        rich_text: list[dict] = []
+
+        for idx, line in enumerate(lines):
+            # Parse each line for LaTeX (existing logic)
+            rich_text.extend(self._parse_line_for_latex(line))
+
+            # Add line break between lines (except last)
+            if idx < len(lines) - 1:
+                rich_text.append({"type": "text", "text": {"content": "\n"}})
+
+        return rich_text if rich_text else [{"type": "text", "text": {"content": text}}]
+
+    def _parse_line_for_latex(self, text: str) -> list[dict]:
+        """Parse single line for inline LaTeX equations ($ and $$).
+
+        Args:
+            text: Single line of text potentially containing LaTeX.
+
+        Returns:
+            List of rich_text objects for this line.
         """
         rich_text: list[dict] = []
         i = 0
 
         while i < len(text):
+            # Detect block equations $$...$$
             if text[i : i + 2] == "$$":
                 end = text.find("$$", i + 2)
                 if end != -1:
@@ -404,6 +566,7 @@ class Engine:
                     i = end + 2
                     continue
 
+            # Detect inline equations $...$
             if text[i] == "$" and (i + 1 < len(text) and text[i + 1] != "$"):
                 end = text.find("$", i + 1)
                 if end != -1:
@@ -415,6 +578,7 @@ class Engine:
                     i = end + 1
                     continue
 
+            # Plain text
             next_dollar = text.find("$", i)
             if next_dollar == -1:
                 next_dollar = len(text)
